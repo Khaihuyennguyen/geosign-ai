@@ -1,10 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
+import re
+import mimetypes
+
 
 from data.corridor_data import CORRIDORS_REGISTRY
 from spatial_engine import evaluate_parcel
@@ -188,12 +191,51 @@ def get_parcel_pdf(parcel_id: str):
     )
 
 @app.get("/{full_path:path}")
-def serve_spa_and_assets(full_path: str):
-    file_path = os.path.join(static_dir, full_path)
+def serve_spa_and_assets(full_path: str, request: Request):
+    file_path = os.path.normpath(os.path.join(static_dir, full_path))
     if full_path and os.path.isfile(file_path):
-        return FileResponse(file_path)
+        media_type, _ = mimetypes.guess_type(file_path)
+        media_type = media_type or "application/octet-stream"
+        
+        # Handle HTTP 206 Range requests for videos and media files
+        range_header = request.headers.get("Range")
+        if range_header and (file_path.endswith(".mp4") or file_path.endswith(".webm")):
+            file_size = os.path.getsize(file_path)
+            byte1, byte2 = 0, None
+            match = re.search(r"bytes=(\d+)-(\d*)", range_header)
+            if match:
+                groups = match.groups()
+                byte1 = int(groups[0])
+                if groups[1]:
+                    byte2 = int(groups[1])
+            if byte2 is None or byte2 >= file_size:
+                byte2 = file_size - 1
+            length = byte2 - byte1 + 1
+            
+            def iterfile():
+                with open(file_path, "rb") as f:
+                    f.seek(byte1)
+                    remaining = length
+                    while remaining > 0:
+                        chunk_size = min(128 * 1024, remaining)
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+                        
+            headers = {
+                "Content-Range": f"bytes {byte1}-{byte2}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(length),
+            }
+            return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=media_type)
+            
+        return FileResponse(file_path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
+        
     index_file = os.path.join(static_dir, "index.html")
     if os.path.exists(index_file):
         return FileResponse(index_file)
     return {"status": "GeoSignAI Backend Online"}
+
 
