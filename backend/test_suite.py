@@ -6,7 +6,7 @@ if sys.platform == "win32":
 
 from fastapi.testclient import TestClient
 from main import app
-from spatial_engine import haversine_distance_feet, evaluate_parcel
+from spatial_engine import haversine_distance_feet, SpatialBufferEngine
 from data.corridor_data import CORRIDORS_REGISTRY
 
 client = TestClient(app)
@@ -15,30 +15,28 @@ def test_01_health_check():
     response = client.get("/api/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "healthy"
-    assert data["service"] == "GeoSignAI"
+    assert data["status"] == "online"
+    assert data["total_registered_parcels"] == 444
 
 def test_02_corridor_listing():
     response = client.get("/api/corridors")
     assert response.status_code == 200
     data = response.json()
-    assert len(data) >= 1
+    assert len(data) == 3
     assert data[0]["id"] == "I35-50Mile-Regional"
 
 def test_03_scout_run_full_corridor():
     req_payload = {
         "corridor_id": "I35-50Mile-Regional",
-        "min_traffic": 25000,
         "min_spacing_feet": 500.0
     }
     response = client.post("/api/scout/run", json=req_payload)
     assert response.status_code == 200
     data = response.json()
     
-    assert data["total_evaluated"] == 160
-    assert data["qualified_count"] > 0
-    assert len(data["existing_billboards"]) == 459
-    assert len(data["cadastral_polygons"]) == 19
+    assert data["total_evaluated"] == 172
+    assert data["approved_clear"] > 0
+    assert len(data["existing_billboards"]) == 15
     assert len(data["agent_thought_traces"]) > 0
 
 def test_04_haversine_distance_calculation():
@@ -57,17 +55,17 @@ def test_05_pdf_report_generation():
     assert len(response.content) > 1000
 
 if __name__ == "__main__":
-    print("Running Step 5 automated test suite...")
+    print("Running Master Automated Test Suite...")
     test_01_health_check()
     print("Test 1: Health Check Passed!")
     test_02_corridor_listing()
-    print("Test 2: Corridor Listing Passed!")
+    print("Test 2: Corridor Listing Passed (3 Corridors)!")
     test_03_scout_run_full_corridor()
-    print("Test 3: Full Scout Run Passed (160 Stations & 19 Polygons)!")
+    print("Test 3: Full Scout Run Passed (172 Parcels on I-35)!")
     test_04_haversine_distance_calculation()
     print("Test 4: Haversine Geodesic Math Passed!")
     test_05_pdf_report_generation()
-    print("Test 5: ReportLab 1-Page Permit PDF Generator Passed!")
+    print("Test 5: Dynamic 1-Page Permit PDF Generator Passed!")
     print("\n========================================================")
-    print("ALL STEP 5 FASTAPI BACKEND TESTS PASSED (100% SUCCESS)!")
+    print("ALL MASTER BACKEND TESTS PASSED (100% SUCCESS)!")
     print("========================================================")

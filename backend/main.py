@@ -1,25 +1,20 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 import os
-import re
-import mimetypes
+import json
+import time
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
-
-from data.corridor_data import CORRIDORS_REGISTRY
-from spatial_engine import evaluate_parcel
+from data.corridor_data import CORRIDORS_REGISTRY, REAL_PARCELS_DATA, EXISTING_BILLBOARDS
+from spatial_engine import SpatialBufferEngine
 from vision_agent import GeminiVisionInspector
 from report_generator import FeasibilityReportGenerator
 
-report_gen = FeasibilityReportGenerator()
-vision_inspector = GeminiVisionInspector()
-
 app = FastAPI(
-    title="GeoSignAI Autonomous Billboard Siting Agent",
-    description="Production-grade AI Agent for automated highway corridor scouting, 500-ft spacing math, Gemini 3.5 visual inspection, and 1-page municipal permit PDF generation.",
+    title="GeoSignAI Autonomous Siting Fleet API",
+    description="Multimodal Geospatial AI Agent Platform for Autonomous Billboard Siting",
     version="2.0.0"
 )
 
@@ -31,211 +26,208 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-if not os.path.exists(static_dir):
-    os.makedirs(static_dir)
+spatial_engine = SpatialBufferEngine(min_spacing_feet=500.0, min_aadt_traffic=25000)
+vision_agent = GeminiVisionInspector()
+pdf_generator = FeasibilityReportGenerator()
 
-
-
-class ScoutRequest(BaseModel):
-    corridor_id: str = "I35-50Mile-Regional"
-    min_traffic: int = 25000
-    min_spacing_feet: float = 500.0
-
-class ScoutedParcelResponse(BaseModel):
-    parcel_id: str
-    name: Optional[str] = None
-    address: str
-    owner_name: str
-    zoning: str
-    aadt_traffic: int
-    coordinates: List[float]
-    lot_boundary: Optional[List[List[float]]] = None
-    county: Optional[str] = None
-    frontage_side: Optional[str] = None
-    has_dense_trees: bool
-    is_qualified: bool
-    disqualification_reasons: List[str]
-    min_distance_to_sign_feet: float
-    nearest_billboard_permit: str
-    nearest_operator: str
-    nearest_coordinates: List[float]
-    spacing_passed: bool
-    spacing_margin_feet: float
-    is_commercial_zoning: bool
-    tree_canopy_present: bool
-    visibility_score: int
-    obstruction_level: str
-    ai_visual_justification: str
-    est_annual_ad_revenue: int
-    pdf_available: bool
-    proof: Optional[Dict[str, Any]] = None
-
-class ScoutCorridorResponse(BaseModel):
-    corridor_id: str
-    corridor_name: str
-    total_evaluated: int
-    qualified_count: int
-    disqualified_count: int
-    parcels: List[ScoutedParcelResponse]
-    highway_centerline: List[List[float]]
-    existing_billboards: List[Dict[str, Any]]
-    cadastral_polygons: Optional[List[Dict[str, Any]]] = None
-    agent_thought_traces: List[str]
-
-@app.get("/")
-def read_root():
-    index_file = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {"status": "GeoSignAI Backend Running", "message": "Visit /static/index.html"}
+class ScoutRunRequest(BaseModel):
+    corridor_id: Optional[str] = "I35-50Mile-Regional"
+    min_spacing_feet: Optional[float] = 500.0
+    min_aadt_traffic: Optional[int] = 25000
 
 @app.get("/api/health")
-def health_check():
-    return {"status": "healthy", "service": "GeoSignAI", "agent_version": "2.0.0"}
+def get_health():
+    has_gemini = bool(vision_agent.client)
+    return {
+        "status": "online",
+        "backend": "FastAPI Python 3.12",
+        "spatial_engine": "Shapely + Geodesic WGS-84",
+        "vision_engine": "Google Gemini 2.5 Flash (Live)" if has_gemini else "Local Geospatial Computer Vision (Spectral Analysis)",
+        "gemini_api_key_configured": has_gemini,
+        "available_corridors": list(CORRIDORS_REGISTRY.keys()),
+        "total_registered_parcels": sum(len(c["parcels"]) for c in CORRIDORS_REGISTRY.values())
+    }
 
 @app.get("/api/corridors")
-def list_corridors():
+def get_corridors():
     return [
         {
             "id": c["id"],
             "name": c["name"],
             "state": c["state"],
-            "county": c["county"],
-            "center": c["center"],
-            "zoom": c["zoom"]
+            "parcel_count": len(c["parcels"]),
+            "billboard_count": len(c["existing_billboards"]),
+            "centerline": c["highway_centerline"]
         }
         for c in CORRIDORS_REGISTRY.values()
     ]
 
-@app.post("/api/scout/run", response_model=ScoutCorridorResponse)
-def scout_corridor(req: ScoutRequest):
-    if req.corridor_id not in CORRIDORS_REGISTRY:
-        raise HTTPException(status_code=404, detail=f"Corridor '{req.corridor_id}' not found.")
+@app.post("/api/scout/run")
+def run_autonomous_scout(req: ScoutRunRequest):
+    corridor_id = req.corridor_id or "I35-50Mile-Regional"
+    if corridor_id not in CORRIDORS_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Corridor '{corridor_id}' not found in registry.")
         
-    corridor = CORRIDORS_REGISTRY[req.corridor_id]
-    existing_billboards = corridor["existing_billboards"]
-    raw_parcels = corridor["parcels"]
-    cadastral_polygons = corridor.get("cadastral_polygons", [])
+    corridor = CORRIDORS_REGISTRY[corridor_id]
+    parcels = corridor["parcels"]
+    billboards = corridor["existing_billboards"]
     
-    thought_traces = [
-        f"[INIT] Autonomous Scout Agent initialized for {corridor['name']}.",
-        f"[DATA] Ingested {len(existing_billboards)} live TxDOT licensed billboard locations from State of Texas database.",
-        f"[INGEST] Ingested {len(raw_parcels)} real individual parcel lots with separate cadastral boundaries.",
-        f"[CADASTRAL] Evaluating Shapely Point-in-Polygon (PIP) spatial intersections against {len(cadastral_polygons)} zoning ribbons...",
-        "[SPATIAL] Executing Haversine Geodesic 500-foot buffer exclusion algorithm (Texas Transportation Code § 391.031)..."
-    ]
+    start_time = time.time()
     
+    # 1. Execute Spatial Buffer Engine
+    spatial_results = spatial_engine.audit_corridor(parcels, billboards)
+    
+    # 2. Dynamic Agent Tool Execution & Thought Trace Generation
     evaluated_parcels = []
-    qualified_count = 0
+    thought_traces = []
+    
+    thought_traces.append(f"[INIT] Autonomous Scout Agent initialized for {corridor['name']}.")
+    thought_traces.append(f"[INGEST] Ingested {len(parcels)} cadastral lots and {len(billboards)} active state-registered signs.")
+    
+    passed_count = 0
+    tree_risk_count = 0
     disqualified_count = 0
     
-    for p in raw_parcels:
-        eval_p = evaluate_parcel(p, existing_billboards, req.min_spacing_feet, cadastral_polygons)
+    for p in spatial_results:
+        p_id = p["parcel_id"]
         
-        if eval_p["is_qualified"]:
-            qualified_count += 1
-            if eval_p["tree_canopy_present"]:
-                thought_traces.append(f"[VISION CAUTION] {eval_p['parcel_id']} ({eval_p['owner_name']}): Passed 500ft spacing ({eval_p['min_distance_to_sign_feet']:,.1f} ft) but flagged for tree canopy obstruction.")
+        if p["is_qualified"]:
+            # Tool Call: Vision Sightline & Canopy Inspection
+            vis = vision_agent.analyze_aerial_imagery(p)
+            
+            p_evaluated = {
+                **p,
+                "tree_canopy_present": vis["tree_canopy_present"],
+                "visibility_score": vis["visibility_score"],
+                "obstruction_level": vis["obstruction_level"],
+                "ai_visual_justification": vis["ai_visual_justification"],
+                "unobstructed_sightline_ft": vis["unobstructed_sightline_ft"],
+                "driver_dwell_time_sec": vis["driver_dwell_time_sec"],
+                "recommended_monopole_height_ft": vis["recommended_monopole_height_ft"],
+                "model_version": vis["model_version"],
+                "pdf_available": True
+            }
+            
+            if vis["tree_canopy_present"]:
+                tree_risk_count += 1
+                if len(thought_traces) < 25:
+                    thought_traces.append(f"[VISION CAUTION] Parcel {p_id}: Spacing OK ({p['min_distance_to_sign_feet']:,.0f} ft), but canopy density is {vis['canopy_density_pct']}%. Tree trimming variance required.")
             else:
-                thought_traces.append(f"[VISION APPROVED] {eval_p['parcel_id']} ({eval_p['owner_name']}): 100% Clear sightline from I-35 lanes. Est. Revenue: ${eval_p['est_annual_ad_revenue']:,}/yr.")
+                passed_count += 1
+                if len(thought_traces) < 25:
+                    thought_traces.append(f"[VISION APPROVED] Parcel {p_id}: Clear {vis['unobstructed_sightline_ft']:.0f}ft sightline ({vis['driver_dwell_time_sec']}s dwell time). Standard {vis['recommended_monopole_height_ft']}ft monopole approved.")
+                    
+            evaluated_parcels.append(p_evaluated)
         else:
             disqualified_count += 1
-            reason = eval_p["disqualification_reasons"][0] if eval_p["disqualification_reasons"] else "Ineligible"
-            thought_traces.append(f"[DISQUALIFIED] {eval_p['parcel_id']}: {reason}")
-            
-        evaluated_parcels.append(eval_p)
-        
-    thought_traces.append(f"[COMPLETE] Corridor analysis complete. {qualified_count} / {len(raw_parcels)} individual lots qualified for municipal permit filings.")
+            evaluated_parcels.append({
+                **p,
+                "tree_canopy_present": False,
+                "visibility_score": 0,
+                "obstruction_level": "Disqualified",
+                "ai_visual_justification": "Disqualified prior to vision analysis.",
+                "unobstructed_sightline_ft": 0,
+                "driver_dwell_time_sec": 0,
+                "recommended_monopole_height_ft": 42.5,
+                "model_version": "N/A",
+                "pdf_available": False
+            })
+            if len(thought_traces) < 25:
+                thought_traces.append(f"[DISQUALIFIED] Parcel {p_id}: {p['disqualification_reasons'][0]}")
+                
+    elapsed = round(time.time() - start_time, 2)
+    thought_traces.append(f"[COMPLETE] Siting scan finished in {elapsed}s: {passed_count} Approved, {tree_risk_count} Tree Risk, {disqualified_count} Disqualified.")
     
     return {
-        "corridor_id": corridor["id"],
+        "corridor_id": corridor_id,
         "corridor_name": corridor["name"],
-        "total_evaluated": len(evaluated_parcels),
-        "qualified_count": qualified_count,
-        "disqualified_count": disqualified_count,
-        "parcels": evaluated_parcels,
+        "total_evaluated": len(parcels),
+        "approved_clear": passed_count,
+        "tree_risk": tree_risk_count,
+        "disqualified": disqualified_count,
+        "execution_time_seconds": elapsed,
+        "agent_thought_traces": thought_traces,
+        "existing_billboards": billboards,
         "highway_centerline": corridor["highway_centerline"],
-        "existing_billboards": existing_billboards,
-        "cadastral_polygons": cadastral_polygons,
-        "agent_thought_traces": thought_traces
+        "parcels": evaluated_parcels
     }
 
 @app.get("/api/parcels/{parcel_id}/pdf")
-def get_parcel_pdf(parcel_id: str):
-    found_parcel = None
-    existing_bb = []
-    cadastral_polygons = []
+def download_feasibility_pdf(parcel_id: str):
+    target_parcel = None
+    target_corridor = None
     
-    for c in CORRIDORS_REGISTRY.values():
-        for p in c["parcels"]:
+    for corridor in CORRIDORS_REGISTRY.values():
+        for p in corridor["parcels"]:
             if p["parcel_id"] == parcel_id:
-                found_parcel = p
-                existing_bb = c["existing_billboards"]
-                cadastral_polygons = c.get("cadastral_polygons", [])
+                target_parcel = p
+                target_corridor = corridor
                 break
-        if found_parcel:
+        if target_parcel:
             break
             
-    if not found_parcel:
-        raise HTTPException(status_code=404, detail=f"Parcel ID {parcel_id} not found.")
+    if not target_parcel:
+        raise HTTPException(status_code=404, detail=f"Parcel ID '{parcel_id}' not found.")
         
-    eval_p = evaluate_parcel(found_parcel, existing_bb, 500.0, cadastral_polygons)
-    vision_data = vision_inspector.analyze_aerial_imagery(eval_p)
-    pdf_path = report_gen.generate_pdf(eval_p, vision_data)
+    # Evaluate spacing and vision
+    eval_res = spatial_engine.evaluate_parcel(target_parcel, target_corridor["existing_billboards"])
+    vision_res = vision_agent.analyze_aerial_imagery(eval_res)
     
+    pdf_path = pdf_generator.generate_pdf(eval_res, vision_res)
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
         filename=f"Feasibility_Report_{parcel_id}.pdf"
     )
 
-@app.get("/{full_path:path}")
-def serve_spa_and_assets(full_path: str, request: Request):
-    file_path = os.path.normpath(os.path.join(static_dir, full_path))
-    if full_path and os.path.isfile(file_path):
-        media_type, _ = mimetypes.guess_type(file_path)
-        media_type = media_type or "application/octet-stream"
+# HTTP 206 Byte-Range Video Streaming for Canvas Scroll Scrubbing
+@app.get("/hero.mp4")
+async def stream_hero_video(request: Request):
+    video_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "hero.mp4")
+    if not os.path.exists(video_path):
+        video_path = os.path.join(os.path.dirname(__file__), "hero.mp4")
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video asset not found.")
         
-        # Handle HTTP 206 Range requests for videos and media files
-        range_header = request.headers.get("Range")
-        if range_header and (file_path.endswith(".mp4") or file_path.endswith(".webm")):
-            file_size = os.path.getsize(file_path)
-            byte1, byte2 = 0, None
-            match = re.search(r"bytes=(\d+)-(\d*)", range_header)
-            if match:
-                groups = match.groups()
-                byte1 = int(groups[0])
-                if groups[1]:
-                    byte2 = int(groups[1])
-            if byte2 is None or byte2 >= file_size:
-                byte2 = file_size - 1
-            length = byte2 - byte1 + 1
-            
-            def iterfile():
-                with open(file_path, "rb") as f:
-                    f.seek(byte1)
-                    remaining = length
-                    while remaining > 0:
-                        chunk_size = min(128 * 1024, remaining)
-                        data = f.read(chunk_size)
-                        if not data:
-                            break
-                        remaining -= len(data)
-                        yield data
-                        
-            headers = {
-                "Content-Range": f"bytes {byte1}-{byte2}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(length),
-            }
-            return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=media_type)
-            
-        return FileResponse(file_path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
+    file_size = os.path.getsize(video_path)
+    range_header = request.headers.get("range")
+    
+    if range_header:
+        parts = range_header.replace("bytes=", "").split("-")
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+        length = end - start + 1
         
-    index_file = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {"status": "GeoSignAI Backend Online"}
+        def iterfile():
+            with open(video_path, "rb") as f:
+                f.seek(start)
+                bytes_left = length
+                while bytes_left > 0:
+                    chunk = f.read(min(bytes_left, 1024 * 64))
+                    if not chunk:
+                        break
+                    bytes_left -= len(chunk)
+                    yield chunk
+                    
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+            "Content-Type": "video/mp4",
+        }
+        return StreamingResponse(iterfile(), status_code=status.HTTP_206_PARTIAL_CONTENT, headers=headers)
+    else:
+        return FileResponse(video_path, media_type="video/mp4")
 
-
+# Serve production frontend if built
+dist_dir = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.exists(dist_dir):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
+    
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        file_path = os.path.join(dist_dir, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(dist_dir, "index.html"))

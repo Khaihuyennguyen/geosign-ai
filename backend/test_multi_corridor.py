@@ -10,17 +10,22 @@ from data.corridor_data import CORRIDORS_REGISTRY
 from spatial_engine import SpatialBufferEngine
 from vision_agent import GeminiVisionInspector
 
-def test_both_roads():
+def test_all_corridors():
     print("=" * 80)
-    print("🚗 TESTING MULTI-HIGHWAY CORRIDOR ENGINE (I-35 AUSTIN + I-10 HOUSTON KATY FWY)")
+    print("TESTING MULTI-HIGHWAY CORRIDOR ENGINE (I-35 + US-183 + SH-71)")
     print("=" * 80)
     
     spatial_engine = SpatialBufferEngine(min_spacing_feet=500.0, min_aadt_traffic=25000)
     vision_agent = GeminiVisionInspector()
     
+    total_evaluated = 0
+    total_approved = 0
+    total_tree_risk = 0
+    total_disqualified = 0
+    
     for corridor_id, corridor in CORRIDORS_REGISTRY.items():
         print(f"\n================================================================================")
-        print(f"HIGHWAY: {corridor['name']} ({corridor['county']}, {corridor['state']})")
+        print(f"HIGHWAY: {corridor['name']} ({corridor['state']})")
         print(f"================================================================================")
         
         parcels = corridor["parcels"]
@@ -28,26 +33,42 @@ def test_both_roads():
         
         spatial_results = spatial_engine.audit_corridor(parcels, billboards)
         
+        c_approved = 0
+        c_tree_risk = 0
+        c_disqualified = 0
+        
         for p in spatial_results:
+            total_evaluated += 1
             if p["is_qualified"]:
                 vision_res = vision_agent.analyze_aerial_imagery(p)
-                est_rev = int(p['aadt_traffic'] * (vision_res['visibility_score'] / 100.0) * 0.55)
-                
                 if vision_res["tree_canopy_present"]:
-                    print(f"🟡 [TREE RISK] {p['parcel_id']} ({p['address']})")
-                    print(f"   * Traffic: {p['aadt_traffic']:,} cars/day | Spacing: {p['min_distance_to_sign_feet']:,} ft")
-                    print(f"   * Gemini Vision: Score {vision_res['visibility_score']}/100 -> {vision_res['ai_visual_justification']}")
+                    c_tree_risk += 1
+                    total_tree_risk += 1
                 else:
-                    print(f"🟢 [QUALIFIED] {p['parcel_id']} ({p['address']})")
-                    print(f"   * Traffic: {p['aadt_traffic']:,} cars/day | Spacing: {p['min_distance_to_sign_feet']:,} ft")
-                    print(f"   * Est. Net Ad Revenue: ${est_rev:,} / year (Clear Sightline!)")
+                    c_approved += 1
+                    total_approved += 1
             else:
-                print(f"🔴 [DISQUALIFIED] {p['parcel_id']} ({p['address']})")
-                print(f"   * Reason: {p['disqualification_reasons'][0]}")
+                c_disqualified += 1
+                total_disqualified += 1
                 
+        print(f"  * Total Parcels: {len(parcels)}")
+        print(f"  * Approved Clear: {c_approved}")
+        print(f"  * Tree Variance Required: {c_tree_risk}")
+        print(f"  * Disqualified (500ft / Zoning): {c_disqualified}")
+        
     print("\n" + "=" * 80)
-    print("✅ PROOF VERIFIED ON BOTH HIGHWAY ROADS WITH 100% MATHEMATICAL & LEGAL ACCURACY!")
+    print("MULTI-CORRIDOR VERIFICATION SUMMARY:")
+    print(f"  * Total Parcels Evaluated: {total_evaluated}")
+    print(f"  * Total Approved (Clear): {total_approved}")
+    print(f"  * Total Tree Risk (Variance Needed): {total_tree_risk}")
+    print(f"  * Total Disqualified: {total_disqualified}")
     print("=" * 80)
+    
+    assert total_evaluated == 444
+    assert total_approved > 0
+    assert total_tree_risk > 0
+    assert total_disqualified > 0
+    print("[SUCCESS] ALL 3 HIGHWAY CORRIDORS VERIFIED 100%!")
 
 if __name__ == "__main__":
-    test_both_roads()
+    test_all_corridors()

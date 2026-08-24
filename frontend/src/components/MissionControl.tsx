@@ -375,10 +375,15 @@ export const MissionControl = ({ onBackToLanding }: MissionControlProps) => {
           {/* Corridor Select Dropdown */}
           <select
             value={activeCorridor}
-            onChange={(e) => setActiveCorridor(e.target.value)}
+            onChange={(e) => {
+              setActiveCorridor(e.target.value);
+              runScout(e.target.value);
+            }}
             className="bg-[#111827] border border-white/15 text-xs text-white rounded-lg px-2.5 py-1 focus:outline-none focus:border-emerald-500"
           >
-            <option value="I35-50Mile-Regional">I-35 50-Mile Regional (Austin/San Marcos)</option>
+            <option value="I35-50Mile-Regional">I-35 Regional 50-Mile (Austin/San Marcos)</option>
+            <option value="US183-Airport-Expwy">US-183 Expressway (Northwest Tech to Airport)</option>
+            <option value="SH71-Bastrop-Corridor">SH-71 Gateway (Austin to Bastrop)</option>
           </select>
 
           {/* Base Map Switcher */}
